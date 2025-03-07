@@ -5,17 +5,54 @@ import os
 import random
 import time
 from typing import List, Union, Dict, Tuple
-
 import numpy as np
 import torch
 from pynvml import nvmlDeviceGetHandleByIndex, nvmlDeviceGetMemoryInfo, nvmlInit, nvmlShutdown, nvmlDeviceGetCount
 from torch import nn
 from torch.nn.utils.rnn import pad_sequence
-
 from hanlp.utils.io_util import get_resource, replace_ext, TimingFileIterator
 from hanlp.utils.log_util import logger, flash
 from hanlp_common.constant import HANLP_VERBOSE
 from hanlp_common.io import load_pickle, save_pickle
+
+# Add imports for Habana support
+try:
+    import habana_frameworks.torch.core as htcore
+
+    HABANA_AVAILABLE = True
+except ImportError:
+    HABANA_AVAILABLE = False
+
+
+def hpus_available() -> Dict[int, float]:
+    """Check for available HPUs
+
+    Returns:
+        Dict mapping HPU IDs to availability ratio (1.0 for all HPUs as memory info not available via API)
+    """
+    if not HABANA_AVAILABLE:
+        return dict()
+
+    try:
+        # Get visible HPU devices
+        visible_devices = os.environ.get('HABANA_VISIBLE_DEVICES', None)
+        num_devices = htcore.get_device_count()
+
+        if num_devices == 0:
+            return dict()
+
+        if visible_devices is None:
+            visible_devices = list(range(num_devices))
+        else:
+            visible_devices = {int(x.strip()) for x in visible_devices.split(',')}
+
+        # For Habana devices, we don't have memory info API like NVIDIA
+        # So we just return 1.0 as the ratio for all available devices
+        hpus = {i: 1.0 for i, real_id in enumerate(visible_devices)}
+        return dict(sorted(hpus.items(), key=lambda x: x[1], reverse=True))
+    except Exception as e:
+        logger.debug(f'Failed to get HPU info due to {e}')
+        return dict()
 
 
 def gpus_available() -> Dict[int, float]:
@@ -36,13 +73,6 @@ def gpus_available() -> Dict[int, float]:
             free = info.free
             ratio = free / total
             gpus[i] = ratio
-            # print(f'total    : {info.total}')
-            # print(f'free     : {info.free}')
-            # print(f'used     : {info.used}')
-            # t = torch.cuda.get_device_properties(0).total_memory
-            # c = torch.cuda.memory_cached(0)
-            # a = torch.cuda.memory_allocated(0)
-            # print(t, c, a)
         nvmlShutdown()
         return dict(sorted(gpus.items(), key=lambda x: x[1], reverse=True))
     except Exception as e:
@@ -50,15 +80,32 @@ def gpus_available() -> Dict[int, float]:
         return dict((i, 1.0) for i in range(torch.cuda.device_count()))
 
 
+def get_available_devices() -> Dict[str, Dict[int, float]]:
+    """Get all available devices (CUDA GPUs and HPUs)
+
+    Returns:
+        Dict mapping device type to device availability info
+    """
+    devices = {}
+    gpus = gpus_available()
+    if gpus:
+        devices['cuda'] = gpus
+
+    hpus = hpus_available()
+    if hpus:
+        devices['hpu'] = hpus
+
+    return devices
+
+
 def cuda_devices(query=None) -> List[int]:
     """Decide which GPUs to use
 
     Args:
-      query:  (Default value = None)
+      query: GPU selection criteria (None, int, float, or list)
 
     Returns:
-
-    
+      List of GPU IDs to use
     """
     if isinstance(query, list):
         if len(query) == 0:
@@ -74,7 +121,7 @@ def cuda_devices(query=None) -> List[int]:
         query = random.choice(gpus_with_same_size)
     if isinstance(query, float):
         gpus = gpus_available()
-        if not query:
+        if not gpus:
             return []
         query = [k for k, v in gpus.items() if v > query]
     elif isinstance(query, int):
@@ -82,82 +129,143 @@ def cuda_devices(query=None) -> List[int]:
     return query
 
 
-def pad_lists(sequences: List[List], dtype=torch.long, padding_value=0):
-    return pad_sequence([torch.tensor(x, dtype=dtype) for x in sequences], True, padding_value)
+def hpu_devices(query=None) -> List[int]:
+    """Decide which HPUs to use
+
+    Args:
+      query: HPU selection criteria (None, int, float, or list)
+
+    Returns:
+      List of HPU IDs to use
+    """
+    if isinstance(query, list):
+        if len(query) == 0:
+            return [-1]
+        return query
+    if query is None:
+        query = hpus_available()
+        if not query:
+            return []
+        size, idx = max((v, k) for k, v in query.items())
+        # When multiple HPUs have the same size, randomly pick one to avoid conflicting
+        hpus_with_same_size = [k for k, v in query.items() if v == size]
+        query = random.choice(hpus_with_same_size)
+    if isinstance(query, float):
+        hpus = hpus_available()
+        if not hpus:
+            return []
+        query = [k for k, v in hpus.items() if v > query]
+    elif isinstance(query, int):
+        query = [query]
+    return query
+
+
+def get_device_str(device_type='auto', device_id=0):
+    """Get device string for torch
+
+    Args:
+        device_type: 'auto', 'cpu', 'cuda', or 'hpu'
+        device_id: device ID
+
+    Returns:
+        device string for torch
+    """
+    if device_type == 'auto':
+        devices = get_available_devices()
+        if 'hpu' in devices and devices['hpu']:
+            return 'hpu'
+        elif 'cuda' in devices and devices['cuda']:
+            return f'cuda:{device_id}'
+        else:
+            return 'cpu'
+    elif device_type == 'hpu':
+        if not HABANA_AVAILABLE:
+            logger.warning("HPU requested but Habana libraries not available. Falling back to CPU.")
+            return 'cpu'
+        return 'hpu'
+    elif device_type == 'cuda':
+        if not torch.cuda.is_available():
+            logger.warning("CUDA requested but not available. Falling back to CPU.")
+            return 'cpu'
+        return f'cuda:{device_id}'
+    else:
+        return 'cpu'
 
 
 def set_seed(seed=233, dont_care_speed=False):
     """Copied from https://github.com/huggingface/transformers/blob/7b75aa9fa55bee577e2c7403301ed31103125a35/src/transformers/trainer.py#L76
-
     Args:
       seed:  (Default value = 233)
       dont_care_speed: True may have a negative single-run performance impact, but ensures deterministic
-
     Returns:
-
-    
-    """
+        """
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     # ^^ safe to call this function even if cuda is not available
     torch.cuda.manual_seed_all(seed)
+    if HABANA_AVAILABLE:
+        # Set Habana specific seeds if available
+        htcore.manual_seed(seed)
     if dont_care_speed:
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
 
 
-def batched_index_select(input, index, dim=1):
-    """
+def move_to_device(tensor, device):
+    """Move tensor to specific device (cpu, cuda, or hpu)
 
     Args:
-      input: B x * x ... x *
-      index: B x M
-      dim:  (Default value = 1)
+        tensor: PyTorch tensor
+        device: device string or torch.device
 
     Returns:
-
-    
+        tensor on specified device
     """
-    views = [input.shape[0]] + [1 if i != dim else -1 for i in range(1, len(input.shape))]
-    expanse = list(input.shape)
-    expanse[0] = -1
-    expanse[dim] = -1
-    index = index.view(views).expand(expanse)
-    return torch.gather(input, dim, index)
+    if isinstance(device, str) and device == 'hpu' and HABANA_AVAILABLE:
+        return tensor.to('hpu')
+    else:
+        return tensor.to(device)
 
 
-def truncated_normal_(tensor, mean=0, std=1):
-    size = tensor.shape
-    tmp = tensor.new_empty(size + (4,)).normal_()
-    valid = (tmp < 2) & (tmp > -2)
-    ind = valid.max(-1, keepdim=True)[1]
-    tensor.data.copy_(tmp.gather(-1, ind).squeeze(-1))
-    tensor.data.mul_(std).add_(mean)
-    return tensor
-
-
-def dtype_of(e: Union[int, bool, float]):
-    if isinstance(e, bool):
-        return torch.bool
-    if isinstance(e, int):
-        return torch.long
-    if isinstance(e, float):
-        return torch.float
-    raise ValueError(f'Unsupported type of {repr(e)}')
-
-
-def mean_model(model: torch.nn.Module):
-    return float(torch.mean(torch.stack([torch.sum(p) for p in model.parameters() if p.requires_grad])))
+def clip_grad_norm(model: nn.Module, grad_norm, transformer: nn.Module = None, transformer_grad_norm=None):
+    if transformer_grad_norm is None:
+        if grad_norm is not None:
+            nn.utils.clip_grad_norm_(filter(lambda p: p.requires_grad, model.parameters()), grad_norm)
+    else:
+        is_transformer = []
+        non_transformer = []
+        transformer = set(transformer.parameters())
+        for p in model.parameters():
+            if not p.requires_grad:
+                continue
+            if p in transformer:
+                is_transformer.append(p)
+            else:
+                non_transformer.append(p)
+        nn.utils.clip_grad_norm_(non_transformer, grad_norm)
+        nn.utils.clip_grad_norm_(is_transformer, transformer_grad_norm)
 
 
 def main():
     start = time.time()
-    print(gpus_available())
-    print(time.time() - start)
-    # print(gpus_available())
-    # print(cuda_devices())
-    # print(cuda_devices(0.1))
+
+    # Print available CUDA GPUs
+    print("Available GPUs:", gpus_available())
+
+    # # Print available Habana HPUs
+    # if HABANA_AVAILABLE:
+    #     print("Available HPUs:", hpus_available())
+    # else:
+    #     print("Habana framework not available")
+    #
+    # # Get all available devices
+    # print("All available devices:", get_available_devices())
+    #
+    # # Print auto-selected device
+    # print("Auto-selected device:", get_device_str())
+    #
+    # print(f"Time elapsed: {time.time() - start:.4f}s")
 
 
 if __name__ == '__main__':
