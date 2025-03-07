@@ -9,6 +9,58 @@ import torch.nn.functional as F
 from hanlp.components.srl.span_rank.util import block_orth_normal_initializer
 
 
+# Add Habana HPU support
+try:
+    import habana_frameworks.torch.core as htcore
+    HABANA_AVAILABLE = True
+except ImportError:
+    HABANA_AVAILABLE = False
+
+
+def to_device(tensor_or_model, device=None):
+    """Move tensor or model to the specified device (CPU, CUDA, or HPU)
+
+    Args:
+        tensor_or_model: PyTorch tensor or model
+        device: target device string ('cpu', 'cuda', 'hpu') or torch.device
+
+    Returns:
+        tensor or model on the specified device
+    """
+    # Auto-detect device if none specified
+    if device is None:
+        if HABANA_AVAILABLE and htcore.is_available():
+            device = 'hpu'
+        elif torch.cuda.is_available():
+            device = 'cuda'
+        else:
+            device = 'cpu'
+
+    # Handle HPU specifically
+    if device == "hpu":
+        try:
+            from habana_frameworks.torch.utils.library_loader import load_habana_module
+            load_habana_module()
+
+            if torch.hpu.is_available():
+                # If input is a model and we're using HPU, use HPU graph for optimization
+                if isinstance(tensor_or_model, nn.Module):
+                    from habana_frameworks.torch.hpu import wrap_in_hpu_graph
+                    tensor_or_model = wrap_in_hpu_graph(tensor_or_model)
+                    return tensor_or_model.to(torch.device(device))
+                else:
+                    # For tensors and other non-module objects
+                    return tensor_or_model.to(torch.device(device))
+            else:
+                print("HPU requested but not available. Falling back to CPU.")
+                return tensor_or_model.to('cpu')
+        except ImportError as e:
+            print(f"Error loading HPU modules: {e}. Falling back to CPU.")
+            return tensor_or_model.to('cpu')
+
+    # For CUDA and CPU
+    return tensor_or_model.to(device)
+
 def get_tensor_np(t):
     return t.data.cpu().numpy()
 
@@ -71,14 +123,12 @@ class DropoutLayer3D(nn.Module):
         self.input_size = input_size
         self.drop_mask = torch.FloatTensor(self.input_size).fill_(1 - self.dropout_rate)
         self.drop_mask = Variable(torch.bernoulli(self.drop_mask), requires_grad=False)
-        if torch.cuda.is_available():
-            self.drop_mask = self.drop_mask.cuda()
+        self.drop_mask = to_device(self.drop_mask)  # Replace the cuda check
 
     def reset_dropout_mask(self, batch_size, length):
         self.drop_mask = torch.FloatTensor(batch_size, length, self.input_size).fill_(1 - self.dropout_rate)
         self.drop_mask = Variable(torch.bernoulli(self.drop_mask), requires_grad=False)
-        if torch.cuda.is_available():
-            self.drop_mask = self.drop_mask.cuda()
+        self.drop_mask = to_device(self.drop_mask)  # Replace the cuda check
 
     def forward(self, x):
         if self.training:
@@ -101,7 +151,7 @@ class DropoutLayer(nn.Module):
 
     def forward(self, x):
         if self.training:
-            return torch.mul(x, self.drop_mask.to(x.device))
+            return torch.mul(x, to_device(self.drop_mask, x.device))
         else:  # eval
             return x * (1.0 - self.dropout_rate)
 
@@ -251,9 +301,9 @@ class VariationalLSTMCell(nn.Module):
 
 
 class VariationalLSTM(nn.Module):
-    """A module that runs multiple steps of LSTM."""
+    """A module that runs multiple steps of LSTM with HPU support."""
 
-    def __init__(self, input_size, hidden_size, num_layers=1, batch_first=False, \
+    def __init__(self, input_size, hidden_size, num_layers=1, batch_first=False,
                  bidirectional=False, dropout_in=0, dropout_out=0):
         super(VariationalLSTM, self).__init__()
         self.input_size = input_size
@@ -275,7 +325,7 @@ class VariationalLSTM(nn.Module):
 
         self._all_weights = []
         for layer in range(num_layers):
-            layer_params = (self.fcells[layer].weight_ih, self.fcells[layer].weight_hh, \
+            layer_params = (self.fcells[layer].weight_ih, self.fcells[layer].weight_hh,
                             self.fcells[layer].bias_ih, self.fcells[layer].bias_hh)
             suffix = ''
             param_names = ['weight_ih_l{}{}', 'weight_hh_l{}{}']
@@ -286,7 +336,7 @@ class VariationalLSTM(nn.Module):
             self._all_weights.append(param_names)
 
             if self.bidirectional:
-                layer_params = (self.bcells[layer].weight_ih, self.bcells[layer].weight_hh, \
+                layer_params = (self.bcells[layer].weight_ih, self.bcells[layer].weight_hh,
                                 self.bcells[layer].bias_ih, self.bcells[layer].bias_hh)
                 suffix = '_reverse'
                 param_names = ['weight_ih_l{}{}', 'weight_hh_l{}{}']
@@ -298,16 +348,13 @@ class VariationalLSTM(nn.Module):
 
         self.reset_parameters()
 
-    def reset_parameters(self):  # modified by kiro
+    def reset_parameters(self):
         for name, param in self.named_parameters():
             print(name)
             if "weight" in name:
-                # for i in range(4):
-                # nn.init.orthogonal(self.__getattr__(name)[self.hidden_size*i:self.hidden_size*(i+1),:])
                 nn.init.orthogonal(self.__getattr__(name))
             if "bias" in name:
                 nn.init.normal(self.__getattr__(name), 0.0, 0.01)
-                # nn.init.constant(self.__getattr__(name), 1.0)  # different from zhang's 0
 
     @staticmethod
     def _forward_rnn(cell, input, masks, initial, drop_masks):
@@ -319,7 +366,8 @@ class VariationalLSTM(nn.Module):
             h_next = h_next * masks[time] + initial[0] * (1 - masks[time])
             c_next = c_next * masks[time] + initial[1] * (1 - masks[time])
             output.append(h_next)
-            if drop_masks is not None: h_next = h_next * drop_masks
+            if drop_masks is not None:
+                h_next = h_next * drop_masks
             hx = (h_next, c_next)
         output = torch.stack(output, 0)
         return output, hx
@@ -334,7 +382,8 @@ class VariationalLSTM(nn.Module):
             h_next = h_next * masks[time] + initial[0] * (1 - masks[time])
             c_next = c_next * masks[time] + initial[1] * (1 - masks[time])
             output.append(h_next)
-            if drop_masks is not None: h_next = h_next * drop_masks
+            if drop_masks is not None:
+                h_next = h_next * drop_masks
             hx = (h_next, c_next)
         output.reverse()
         output = torch.stack(output, 0)
@@ -344,35 +393,38 @@ class VariationalLSTM(nn.Module):
         if self.batch_first:
             input = input.transpose(0, 1)  # transpose: return the transpose matrix
             masks = torch.unsqueeze(masks.transpose(0, 1), dim=2)
+
         max_time, batch_size, _ = input.size()
         masks = masks.expand(-1, -1, self.hidden_size)  # expand: -1 means not expand that dimension
+
         if initial is None:
-            initial = Variable(input.data.new(batch_size, self.hidden_size).zero_())
+            initial = to_device(Variable(input.data.new(batch_size, self.hidden_size).zero_()))
             initial = (initial, initial)  # h0, c0
+
         h_n = []
         c_n = []
-
         for layer in range(self.num_layers):
             max_time, batch_size, input_size = input.size()
             input_mask, hidden_mask = None, None
+
             if self.training:  # when training, use the dropout
-                input_mask = input.data.new(batch_size, input_size).fill_(1 - self.dropout_in)
+                input_mask = to_device(input.data.new(batch_size, input_size).fill_(1 - self.dropout_in))
                 input_mask = Variable(torch.bernoulli(input_mask), requires_grad=False)
                 input_mask = input_mask / (1 - self.dropout_in)
                 # permute: exchange the dimension
                 input_mask = torch.unsqueeze(input_mask, dim=2).expand(-1, -1, max_time).permute(2, 0, 1)
                 input = input * input_mask
 
-                hidden_mask = input.data.new(batch_size, self.hidden_size).fill_(1 - self.dropout_out)
+                hidden_mask = to_device(input.data.new(batch_size, self.hidden_size).fill_(1 - self.dropout_out))
                 hidden_mask = Variable(torch.bernoulli(hidden_mask), requires_grad=False)
                 hidden_mask = hidden_mask / (1 - self.dropout_out)
 
-            layer_output, (layer_h_n, layer_c_n) = VariationalLSTM._forward_rnn(cell=self.fcells[layer], \
+            layer_output, (layer_h_n, layer_c_n) = VariationalLSTM._forward_rnn(cell=self.fcells[layer],
                                                                                 input=input, masks=masks,
                                                                                 initial=initial,
                                                                                 drop_masks=hidden_mask)
             if self.bidirectional:
-                blayer_output, (blayer_h_n, blayer_c_n) = VariationalLSTM._forward_brnn(cell=self.bcells[layer], \
+                blayer_output, (blayer_h_n, blayer_c_n) = VariationalLSTM._forward_brnn(cell=self.bcells[layer],
                                                                                         input=input, masks=masks,
                                                                                         initial=initial,
                                                                                         drop_masks=hidden_mask)
@@ -383,6 +435,8 @@ class VariationalLSTM(nn.Module):
 
         h_n = torch.stack(h_n, 0)
         c_n = torch.stack(c_n, 0)
+
         if self.batch_first:
             input = input.transpose(1, 0)  # transpose: return the transpose matrix
+
         return input, (h_n, c_n)
