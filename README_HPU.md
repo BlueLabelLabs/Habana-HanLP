@@ -1,69 +1,45 @@
-# HanLP Intel® Gaudi® HPU Usage
+# HanLP with Intel® Gaudi® HPU
 
-This document describes the setup and deployment of HanLP with Intel® Gaudi® HPU environments.
+## Overview
+HanLP is a multilingual Natural Language Processing (NLP) library built on PyTorch and TensorFlow 2.x, designed for researchers and enterprises. It supports state-of-the-art deep learning techniques and provides a wide range of NLP tasks, including:
+- Tokenization
+- Lemmatization
+- Part-of-Speech (POS) Tagging
+- Named Entity Recognition (NER)
+- Dependency Parsing
+- Semantic Role Labeling (SRL)
+- Abstract Meaning Representation (AMR) Parsing
 
-## Intel® Gaudi® HPU Usage
+## Running HanLP on Intel® Gaudi® HPU
+This guide provides steps to build and run HanLP using Intel® Gaudi® HPU for accelerated performance.
 
-### Build the Docker Image
-
-To use Intel® Gaudi® HPU for running HanLP, start by building a Docker image with the appropriate environment setup.
+### 1. Build the Docker Image
+To run HanLP on Intel® Gaudi® HPU, you need to build a Docker image with the required environment.
 
 ```bash
 docker build -t hanlp_hpu:latest -f Dockerfile.hpu .
 ```
 
-In the `Dockerfile.hpu`, we use the `vault.habana.ai/gaudi-docker/1.18.0/ubuntu22.04/habanalabs/pytorch-installer-2.4.0:latest` base image. Ensure the base image version matches your setup.
+The `Dockerfile.hpu` uses the `vault.habana.ai/gaudi-docker/1.18.0/ubuntu22.04/habanalabs/pytorch-installer-2.4.0:latest` base image, ensuring compatibility with Habana Gaudi accelerators.
 
-See the [PyTorch Docker Images for the Intel® Gaudi® Accelerator](https://developer.habana.ai/catalog/pytorch-container/) for more information.
-
-### Run the Container
-
-Start the container using the following command:
+### 2. Run the Docker Container
+Once the image is built, launch the container with the following command:
 
 ```bash
 docker run -it --runtime=habana hanlp_hpu:latest
 ```
 
-### Dockerfile (Dockerfile.hpu)
+### 3. Using HanLP Inside the Container
+After starting the container, you can use HanLP through Python. Here’s an example of loading a pre-trained model and processing text:
 
-```Dockerfile
-# Use the official Gaudi Docker image with PyTorch
-FROM vault.habana.ai/gaudi-docker/1.18.0/ubuntu22.04/habanalabs/pytorch-installer-2.4.0:latest
-
-# Set environment variables for Habana
-ENV HABANA_VISIBLE_DEVICES=all
-ENV OMPI_MCA_btl_vader_single_copy_mechanism=none
-ENV PT_HPU_LAZY_ACC_PAR_MODE=0
-ENV PT_HPU_ENABLE_LAZY_COLLECTIVES=1
-
-# Set timezone to UTC and install essential packages
-ENV DEBIAN_FRONTEND="noninteractive" TZ=Etc/UTC
-RUN apt-get update && apt-get install -y \
-    tzdata \
-    python3-pip \
-    && rm -rf /var/lib/apt/lists/*
-
-# Clone HanLP repository
-RUN git clone https://github.com/hankcs/HanLP.git /workspace/hanlp
-
-WORKDIR /workspace/hanlp
-
-# Copy HPU-specific requirements
-COPY requirements_hpu.txt /workspace/requirements_hpu.txt
-
-# Install Python packages
-RUN pip install --upgrade pip \
-    && pip install -e ".[full]" \
-    && pip install -r /workspace/requirements_hpu.txt
+```python
+import hanlp
+HanLP = hanlp.load(hanlp.pretrained.mtl.UD_ONTONOTES_TOK_POS_LEM_FEA_NER_SRL_DEP_SDP_CON_XLMR_BASE)
+print(HanLP(['HanLP provides state-of-the-art NLP techniques.']))
 ```
 
-### requirements_hpu.txt
+This runs HanLP’s multi-task model, performing tokenization, POS tagging, dependency parsing, and more.
 
-```text
-optimum-habana==1.14.1
-transformers==4.45.2
-huggingface-hub==0.26.2
-tiktoken==0.8.0
-torch-geometric==2.6.1
-numba==0.60.0
-```
+## Additional Resources
+For more details, visit the [HanLP Documentation](https://hanlp.hankcs.com/docs/).
+
