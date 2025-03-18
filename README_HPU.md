@@ -1,4 +1,4 @@
-# HanLP with Intel® Gaudi® HPU
+# Running HanLP on Intel Gaudi HPU
 
 ## Overview
 HanLP is a multilingual Natural Language Processing (NLP) library built on PyTorch and TensorFlow 2.x, designed for researchers and enterprises. It supports state-of-the-art deep learning techniques and provides a wide range of NLP tasks, including:
@@ -10,8 +10,12 @@ HanLP is a multilingual Natural Language Processing (NLP) library built on PyTor
 - Semantic Role Labeling (SRL)
 - Abstract Meaning Representation (AMR) Parsing
 
-## Running HanLP on Intel® Gaudi® HPU
-This guide provides steps to build and run HanLP using Intel® Gaudi® HPU for accelerated performance.
+## Requirements
+
+- Intel Gaudi HPU device
+- Habana SynapseAI SDK installed
+- HanLP library
+
 
 ### 1. Build the Docker Image
 To run HanLP on Intel® Gaudi® HPU, you need to build a Docker image with the required environment.
@@ -29,17 +33,43 @@ Once the image is built, launch the container with the following command:
 docker run -it --runtime=habana hanlp_hpu:latest
 ```
 
-### 3. Using HanLP Inside the Container
-After starting the container, you can use HanLP through Python. Here’s an example of loading a pre-trained model and processing text:
+
+### 3. Usage
+
+HanLP supports running on Intel Gaudi HPU devices. You can specify the device when loading models:
 
 ```python
 import hanlp
-HanLP = hanlp.load(hanlp.pretrained.mtl.UD_ONTONOTES_TOK_POS_LEM_FEA_NER_SRL_DEP_SDP_CON_XLMR_BASE)
-print(HanLP(['HanLP provides state-of-the-art NLP techniques.']))
+
+# Load model onto HPU device
+tokenizer = hanlp.load('MODEL_NAME', devices='hpu')
+
+# For multi-HPU usage, specify device indices
+parser = hanlp.load('MODEL_NAME', devices=[0, 1]) # Uses HPU devices 0 and 1
 ```
 
-This runs HanLP’s multi-task model, performing tokenization, POS tagging, dependency parsing, and more.
+## Example
+
+Here's a complete example of using HanLP with HPU:
+
+```python
+import hanlp
+
+# Load a tokenizer model on HPU
+tokenizer = hanlp.load('MODEL_NAME', devices='hpu')
+
+# Process some text
+text = "你好，世界！" 
+result = tokenizer(text)
+print(result)
+```
+
+## Notes
+
+- Make sure you have the Habana SynapseAI SDK properly installed and configured
+- HPU support requires PyTorch with Habana extensions
+- Not all models may be optimized for HPU - check model documentation for compatibility
+- For best performance, batch processing is recommended when using HPU devices
 
 ## Additional Resources
 For more details, visit the [HanLP Documentation](https://hanlp.hankcs.com/docs/).
-
